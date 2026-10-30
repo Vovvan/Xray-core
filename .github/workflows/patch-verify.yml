@@ -52,12 +52,12 @@ jobs:
       - name: Apply patches
         run: |
           shopt -s nullglob
-          patches=(../patch-repo/patches/*.patch)
+          patches=("$GITHUB_WORKSPACE"/patch-repo/patches/*.patch)
           if [ ${#patches[@]} -eq 0 ]; then
-            echo "No patches found in patch-repo/patches" >&2
+            echo "No patches found in $GITHUB_WORKSPACE/patch-repo/patches" >&2
             exit 1
           fi
-          git -c user.name=ci -c user.email=ci@example.com am -3 "${patches[@]}"
+          git -C target -c user.name=ci -c user.email=ci@example.com am -3 "${patches[@]}"
 
       - name: Build
         working-directory: target
