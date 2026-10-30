@@ -1,0 +1,197 @@
+From abb3c5e0fc4d3f718d226844ea20fa3966f6a257 Mon Sep 17 00:00:00 2001
+From: Vovvan <Vovvan@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:22:47 +0000
+Subject: [PATCH 2/3] test(socks): cover dynamic user registry
+
+---
+ proxy/socks/usermanager_test.go | 178 ++++++++++++++++++++++++++++++++
+ 1 file changed, 178 insertions(+)
+ create mode 100644 proxy/socks/usermanager_test.go
+
+diff --git a/proxy/socks/usermanager_test.go b/proxy/socks/usermanager_test.go
+new file mode 100644
+index 00000000..af48ab56
+--- /dev/null
++++ b/proxy/socks/usermanager_test.go
+@@ -0,0 +1,178 @@
++package socks
++
++import (
++	"context"
++	"testing"
++
++	"github.com/xtls/xray-core/common/protocol"
++)
++
++func testMemoryUser(email, username, password string, level uint32) *protocol.MemoryUser {
++	return &protocol.MemoryUser{
++		Email: email,
++		Level: level,
++		Account: &Account{
++			Username: username,
++			Password: password,
++		},
++	}
++}
++
++func TestUserValidatorAddAuthenticateRemove(t *testing.T) {
++	v := newUserValidator()
++	u := testMemoryUser("alice@example.com", "alice", "secret", 7)
++	if err := v.Add(u); err != nil {
++		t.Fatal(err)
++	}
++
++	got, ok := v.Authenticate("alice", "secret")
++	if !ok {
++		t.Fatal("expected successful authentication")
++	}
++	if got != u {
++		t.Fatal("authenticate returned a different user")
++	}
++	if _, ok := v.Authenticate("alice", "wrong"); ok {
++		t.Fatal("expected authentication failure")
++	}
++	if _, ok := v.Authenticate("unknown", "secret"); ok {
++		t.Fatal("expected authentication failure for unknown user")
++	}
++
++	if v.GetCount() != 1 {
++		t.Fatalf("count = %d, want 1", v.GetCount())
++	}
++	if got := v.GetByEmail("ALICE@example.com"); got != u {
++		t.Fatal("email lookup is not case-insensitive")
++	}
++	if got := v.GetAll(); len(got) != 1 || got[0] != u {
++		t.Fatal("unexpected user list")
++	}
++
++	if err := v.Del("alice@example.com"); err != nil {
++		t.Fatal(err)
++	}
++	if v.GetCount() != 0 {
++		t.Fatalf("count = %d, want 0", v.GetCount())
++	}
++	if _, ok := v.Authenticate("alice", "secret"); ok {
++		t.Fatal("removed user can still authenticate")
++	}
++	if err := v.Del("alice@example.com"); err == nil {
++		t.Fatal("expected error removing an unknown user")
++	}
++}
++
++func TestUserValidatorRejectsDuplicatesWithoutMutation(t *testing.T) {
++	v := newUserValidator()
++	first := testMemoryUser("alice@example.com", "alice", "secret", 1)
++	if err := v.Add(first); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := v.Add(testMemoryUser("other@example.com", "alice", "other", 1)); err == nil {
++		t.Fatal("expected duplicate username error")
++	}
++	if err := v.Add(testMemoryUser("alice@example.com", "other", "other", 1)); err == nil {
++		t.Fatal("expected duplicate email error")
++	}
++
++	if v.GetCount() != 1 {
++		t.Fatalf("count = %d, want 1", v.GetCount())
++	}
++	if got, ok := v.Authenticate("alice", "secret"); !ok || got != first {
++		t.Fatal("failed adds changed the existing user")
++	}
++	if got := v.GetByEmail("other@example.com"); got != nil {
++		t.Fatal("failed add leaked a user into the email index")
++	}
++}
++
++func TestUserValidatorReplacesSeededStaticUser(t *testing.T) {
++	v := newUserValidator()
++	if err := v.seed(map[string]string{"alice": "old"}, 5); err != nil {
++		t.Fatal(err)
++	}
++
++	got, ok := v.Authenticate("alice", "old")
++	if !ok {
++		t.Fatal("seeded user cannot authenticate")
++	}
++	if got.Email != "alice" || got.Level != 5 {
++		t.Fatalf("seeded user = %q level %d, want alice level 5", got.Email, got.Level)
++	}
++
++	dynamic := testMemoryUser("alice@example.com", "alice", "new", 9)
++	if err := v.Add(dynamic); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, ok := v.Authenticate("alice", "old"); ok {
++		t.Fatal("replaced static password still works")
++	}
++	got, ok = v.Authenticate("alice", "new")
++	if !ok || got != dynamic {
++		t.Fatal("dynamic replacement cannot authenticate")
++	}
++	if got.Level != 9 || got.Email != "alice@example.com" {
++		t.Fatalf("dynamic user = %q level %d", got.Email, got.Level)
++	}
++	if got := v.GetByEmail("alice"); got != nil {
++		t.Fatal("replaced static email index was not removed")
++	}
++	if v.GetCount() != 1 {
++		t.Fatalf("count = %d, want 1", v.GetCount())
++	}
++}
++
++func TestUserValidatorRejectsInvalidUsers(t *testing.T) {
++	v := newUserValidator()
++	valid := testMemoryUser("alice@example.com", "alice", "secret", 0)
++
++	tests := []struct {
++		name string
++		user *protocol.MemoryUser
++	}{
++		{name: "nil", user: nil},
++		{name: "empty email", user: testMemoryUser("", "alice", "secret", 0)},
++		{name: "wrong account", user: &protocol.MemoryUser{Email: "alice@example.com"}},
++		{name: "empty username", user: testMemoryUser("alice@example.com", "", "secret", 0)},
++		{name: "empty password", user: testMemoryUser("alice@example.com", "alice", "", 0)},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if err := v.Add(tt.user); err == nil {
++				t.Fatal("expected validation error")
++			}
++		})
++	}
++
++	if err := v.Add(valid); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestServerImplementsUserManager(t *testing.T) {
++	s := &Server{validator: newUserValidator()}
++	ctx := context.Background()
++	u := testMemoryUser("alice@example.com", "alice", "secret", 3)
++
++	if err := s.AddUser(ctx, u); err != nil {
++		t.Fatal(err)
++	}
++	if got := s.GetUser(ctx, "alice@example.com"); got != u {
++		t.Fatal("GetUser returned an unexpected user")
++	}
++	if got := s.GetUsersCount(ctx); got != 1 {
++		t.Fatalf("GetUsersCount = %d, want 1", got)
++	}
++	if got := s.GetUsers(ctx); len(got) != 1 || got[0] != u {
++		t.Fatal("GetUsers returned an unexpected list")
++	}
++	if err := s.RemoveUser(ctx, "alice@example.com"); err != nil {
++		t.Fatal(err)
++	}
++	if got := s.GetUsersCount(ctx); got != 0 {
++		t.Fatalf("GetUsersCount = %d, want 0", got)
++	}
++}
+-- 
+2.47.3
+

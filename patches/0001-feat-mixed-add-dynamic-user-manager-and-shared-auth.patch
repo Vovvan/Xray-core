@@ -1,0 +1,444 @@
+From c5489260fa5aebbb6327522c4da4b7a8223952c4 Mon Sep 17 00:00:00 2001
+From: Vovvan <Vovvan@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 06:22:46 +0000
+Subject: [PATCH 1/3] feat(mixed): add dynamic user manager and shared auth
+
+---
+ proxy/http/authenticator.go |   9 ++
+ proxy/http/server.go        |  23 +++-
+ proxy/socks/protocol.go     |  41 ++++----
+ proxy/socks/server.go       |  18 +++-
+ proxy/socks/usermanager.go  | 204 ++++++++++++++++++++++++++++++++++++
+ 5 files changed, 273 insertions(+), 22 deletions(-)
+ create mode 100644 proxy/http/authenticator.go
+ create mode 100644 proxy/socks/usermanager.go
+
+diff --git a/proxy/http/authenticator.go b/proxy/http/authenticator.go
+new file mode 100644
+index 00000000..a3ce5f57
+--- /dev/null
++++ b/proxy/http/authenticator.go
+@@ -0,0 +1,9 @@
++package http
++
++import "github.com/xtls/xray-core/common/protocol"
++
++// Authenticator validates HTTP proxy credentials against the mixed inbound's
++// dynamic user registry.
++type Authenticator interface {
++	Authenticate(username, password string) (*protocol.MemoryUser, bool)
++}
+diff --git a/proxy/http/server.go b/proxy/http/server.go
+index b89c67c0..dcd4d0ff 100644
+--- a/proxy/http/server.go
++++ b/proxy/http/server.go
+@@ -31,6 +31,7 @@ import (
+ type Server struct {
+ 	config        *ServerConfig
+ 	policyManager policy.Manager
++	authenticator Authenticator
+ }
+ 
+ // NewServer creates a new HTTP inbound handler.
+@@ -44,6 +45,13 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+ 	return s, nil
+ }
+ 
++// SetAuthenticator replaces static account authentication with a dynamic
++// authenticator. It is used by the mixed inbound, which shares the SOCKS user
++// registry between its SOCKS and HTTP paths.
++func (s *Server) SetAuthenticator(a Authenticator) {
++	s.authenticator = a
++}
++
+ func (s *Server) policy() policy.Session {
+ 	config := s.config
+ 	p := s.policyManager.ForLevel(config.UserLevel)
+@@ -118,7 +126,20 @@ Start:
+ 		return errors.New("failed to read http request").Base(err)
+ 	}
+ 
+-	if len(s.config.Accounts) > 0 {
++	if s.authenticator != nil {
++		user, pass, ok := parseBasicAuth(request.Header.Get("Proxy-Authorization"))
++		if !ok {
++			return common.Error2(conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")))
++		}
++		mu, authenticated := s.authenticator.Authenticate(user, pass)
++		if !authenticated || mu == nil {
++			return common.Error2(conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")))
++		}
++		if inbound != nil {
++			inbound.User.Email = mu.Email
++			inbound.User.Level = mu.Level
++		}
++	} else if len(s.config.Accounts) > 0 {
+ 		user, pass, ok := parseBasicAuth(request.Header.Get("Proxy-Authorization"))
+ 		if !ok || !s.config.HasAccount(user, pass) {
+ 			return common.Error2(conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")))
+diff --git a/proxy/socks/protocol.go b/proxy/socks/protocol.go
+index d71c0fb1..feae11d4 100644
+--- a/proxy/socks/protocol.go
++++ b/proxy/socks/protocol.go
+@@ -44,6 +44,7 @@ var addrParser = protocol.NewAddressParser(
+ 
+ type ServerSession struct {
+ 	config       *ServerConfig
++	validator    *userValidator
+ 	address      net.Address
+ 	port         net.Port
+ 	localAddress net.Address
+@@ -98,12 +99,12 @@ func (s *ServerSession) handshake4(cmd byte, reader io.Reader, writer io.Writer)
+ 	}
+ }
+ 
+-func (s *ServerSession) auth5(nMethod byte, reader io.Reader, writer io.Writer) (username string, err error) {
++func (s *ServerSession) auth5(nMethod byte, reader io.Reader, writer io.Writer) (user *protocol.MemoryUser, err error) {
+ 	buffer := buf.StackNew()
+ 	defer buffer.Release()
+ 
+ 	if _, err = buffer.ReadFullFrom(reader, int32(nMethod)); err != nil {
+-		return "", errors.New("failed to read auth methods").Base(err)
++		return nil, errors.New("failed to read auth methods").Base(err)
+ 	}
+ 
+ 	var expectedAuth byte = authNotRequired
+@@ -113,39 +114,41 @@ func (s *ServerSession) auth5(nMethod byte, reader io.Reader, writer io.Writer)
+ 
+ 	if !hasAuthMethod(expectedAuth, buffer.BytesRange(0, int32(nMethod))) {
+ 		writeSocks5AuthenticationResponse(writer, socks5Version, authNoMatchingMethod)
+-		return "", errors.New("no matching auth method")
++		return nil, errors.New("no matching auth method")
+ 	}
+ 
+ 	if err := writeSocks5AuthenticationResponse(writer, socks5Version, expectedAuth); err != nil {
+-		return "", errors.New("failed to write auth response").Base(err)
++		return nil, errors.New("failed to write auth response").Base(err)
+ 	}
+ 
+ 	if expectedAuth == authPassword {
+-		username, password, err := ReadUsernamePassword(reader)
+-		if err != nil {
+-			return "", errors.New("failed to read username and password for authentication").Base(err)
++		username, password, readErr := ReadUsernamePassword(reader)
++		if readErr != nil {
++			return nil, errors.New("failed to read username and password for authentication").Base(readErr)
+ 		}
+ 
+-		if !s.config.HasAccount(username, password) {
++		if s.validator == nil {
++			writeSocks5AuthenticationResponse(writer, 0x01, 0xFF)
++			return nil, errors.New("invalid username or password")
++		}
++		user, ok := s.validator.Authenticate(username, password)
++		if !ok {
+ 			writeSocks5AuthenticationResponse(writer, 0x01, 0xFF)
+-			return "", errors.New("invalid username or password")
++			return nil, errors.New("invalid username or password")
+ 		}
+ 
+ 		if err := writeSocks5AuthenticationResponse(writer, 0x01, 0x00); err != nil {
+-			return "", errors.New("failed to write auth response").Base(err)
++			return nil, errors.New("failed to write auth response").Base(err)
+ 		}
+-		return username, nil
++		return user, nil
+ 	}
+ 
+-	return "", nil
++	return nil, nil
+ }
+ 
+ func (s *ServerSession) handshake5(nMethod byte, reader io.Reader, writer net.Conn) (*protocol.RequestHeader, *TempUDPConn, error) {
+-	var (
+-		username string
+-		err      error
+-	)
+-	if username, err = s.auth5(nMethod, reader, writer); err != nil {
++	user, err := s.auth5(nMethod, reader, writer)
++	if err != nil {
+ 		return nil, nil, err
+ 	}
+ 
+@@ -161,8 +164,8 @@ func (s *ServerSession) handshake5(nMethod byte, reader io.Reader, writer net.Co
+ 	}
+ 
+ 	request := new(protocol.RequestHeader)
+-	if username != "" {
+-		request.User = &protocol.MemoryUser{Email: username}
++	if user != nil {
++		request.User = user
+ 	}
+ 	switch cmd {
+ 	case cmdTCPConnect, cmdTorResolve, cmdTorResolvePTR:
+diff --git a/proxy/socks/server.go b/proxy/socks/server.go
+index d68e5c43..84e73444 100644
+--- a/proxy/socks/server.go
++++ b/proxy/socks/server.go
+@@ -31,23 +31,35 @@ type Server struct {
+ 	policyManager policy.Manager
+ 	cone          bool
+ 	httpServer    *http.Server
++	validator     *userValidator
+ }
+ 
+ // NewServer creates a new Server object.
+ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
+ 	v := core.MustFromContext(ctx)
++	validator := newUserValidator()
++	if config.AuthType == AuthType_PASSWORD {
++		if err := validator.seed(config.Accounts, config.UserLevel); err != nil {
++			return nil, errors.New("failed to initialize socks users").Base(err)
++		}
++	}
+ 	s := &Server{
+ 		config:        config,
+ 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
+ 		cone:          ctx.Value("cone").(bool),
++		validator:     validator,
+ 	}
+ 	httpConfig := &http.ServerConfig{
+ 		UserLevel: config.UserLevel,
+ 	}
++	httpServer, err := http.NewServer(ctx, httpConfig)
++	if err != nil {
++		return nil, err
++	}
++	s.httpServer = httpServer
+ 	if config.AuthType == AuthType_PASSWORD {
+-		httpConfig.Accounts = config.Accounts
++		s.httpServer.SetAuthenticator(validator)
+ 	}
+-	s.httpServer, _ = http.NewServer(ctx, httpConfig)
+ 	return s, nil
+ }
+ 
+@@ -107,6 +119,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
+ 
+ 	svrSession := &ServerSession{
+ 		config:       s.config,
++		validator:    s.validator,
+ 		address:      inbound.Gateway.Address,
+ 		port:         inbound.Gateway.Port,
+ 		localAddress: net.IPAddress(conn.LocalAddr().(*net.TCPAddr).IP),
+@@ -134,6 +147,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
+ 	}
+ 	if request.User != nil {
+ 		inbound.User.Email = request.User.Email
++		inbound.User.Level = request.User.Level
+ 	}
+ 
+ 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
+diff --git a/proxy/socks/usermanager.go b/proxy/socks/usermanager.go
+new file mode 100644
+index 00000000..3e0b2926
+--- /dev/null
++++ b/proxy/socks/usermanager.go
+@@ -0,0 +1,204 @@
++package socks
++
++import (
++	"context"
++	"crypto/subtle"
++	"strings"
++	"sync"
++
++	"github.com/xtls/xray-core/common/errors"
++	"github.com/xtls/xray-core/common/protocol"
++	"github.com/xtls/xray-core/proxy"
++)
++
++// userValidator stores SOCKS users in memory. Accounts loaded from the static
++// config are seeded into the same registry so that they remain available to
++// the dynamic authentication path.
++type userValidator struct {
++	mu      sync.RWMutex
++	byName  map[string]*protocol.MemoryUser
++	byEmail map[string]*protocol.MemoryUser
++	static  map[string]struct{}
++}
++
++func newUserValidator() *userValidator {
++	return &userValidator{
++		byName:  make(map[string]*protocol.MemoryUser),
++		byEmail: make(map[string]*protocol.MemoryUser),
++		static:  make(map[string]struct{}),
++	}
++}
++
++func (v *userValidator) seed(accounts map[string]string, level uint32) error {
++	for username, password := range accounts {
++		user := &protocol.MemoryUser{
++			Email: username,
++			Level: level,
++			Account: &Account{
++				Username: username,
++				Password: password,
++			},
++		}
++		if err := v.add(user, false, true); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (v *userValidator) add(u *protocol.MemoryUser, replaceStatic, markStatic bool) error {
++	if u == nil {
++		return errors.New("socks: user must not be nil")
++	}
++	if u.Email == "" {
++		return errors.New("socks: user email must not be empty")
++	}
++	account, ok := u.Account.(*Account)
++	if !ok || account == nil {
++		return errors.New("socks: account must be *socks.Account")
++	}
++	if account.Username == "" {
++		return errors.New("socks: username must not be empty")
++	}
++	if account.Password == "" {
++		return errors.New("socks: password must not be empty")
++	}
++
++	emailKey := strings.ToLower(u.Email)
++
++	v.mu.Lock()
++	defer v.mu.Unlock()
++
++	existingByName, foundByName := v.byName[account.Username]
++	existingByEmail, foundByEmail := v.byEmail[emailKey]
++	if foundByName && (!replaceStatic || !v.isStaticLocked(existingByName)) {
++		return errors.New("socks: user ", account.Username, " already exists")
++	}
++	if foundByEmail && (!replaceStatic || !v.isStaticLocked(existingByEmail)) {
++		return errors.New("socks: email ", u.Email, " already exists")
++	}
++	if foundByName {
++		v.deleteLocked(existingByName)
++	}
++	if foundByEmail {
++		v.deleteLocked(existingByEmail)
++	}
++
++	v.byName[account.Username] = u
++	v.byEmail[emailKey] = u
++	if markStatic {
++		v.static[account.Username] = struct{}{}
++	}
++	return nil
++}
++
++func (v *userValidator) isStaticLocked(u *protocol.MemoryUser) bool {
++	account, ok := u.Account.(*Account)
++	if !ok || account == nil {
++		return false
++	}
++	_, ok = v.static[account.Username]
++	return ok
++}
++
++func (v *userValidator) deleteLocked(u *protocol.MemoryUser) {
++	if u == nil {
++		return
++	}
++	if account, ok := u.Account.(*Account); ok && account != nil {
++		delete(v.byName, account.Username)
++		delete(v.static, account.Username)
++	}
++	delete(v.byEmail, strings.ToLower(u.Email))
++}
++
++// Add adds a dynamic user. It replaces a user that was seeded from the static
++// config with the same username or email.
++func (v *userValidator) Add(u *protocol.MemoryUser) error {
++	return v.add(u, true, false)
++}
++
++func (v *userValidator) Del(email string) error {
++	if email == "" {
++		return errors.New("socks: email must not be empty")
++	}
++
++	emailKey := strings.ToLower(email)
++
++	v.mu.Lock()
++	defer v.mu.Unlock()
++
++	u, found := v.byEmail[emailKey]
++	if !found {
++		return errors.New("socks: user ", email, " not found")
++	}
++	v.deleteLocked(u)
++	return nil
++}
++
++func (v *userValidator) Authenticate(username, password string) (*protocol.MemoryUser, bool) {
++	v.mu.RLock()
++	u, found := v.byName[username]
++	v.mu.RUnlock()
++	if !found {
++		return nil, false
++	}
++
++	account, ok := u.Account.(*Account)
++	if !ok || account == nil {
++		return nil, false
++	}
++	if subtle.ConstantTimeCompare([]byte(account.Password), []byte(password)) != 1 {
++		return nil, false
++	}
++	return u, true
++}
++
++func (v *userValidator) GetByEmail(email string) *protocol.MemoryUser {
++	v.mu.RLock()
++	defer v.mu.RUnlock()
++	return v.byEmail[strings.ToLower(email)]
++}
++
++func (v *userValidator) GetAll() []*protocol.MemoryUser {
++	v.mu.RLock()
++	defer v.mu.RUnlock()
++	users := make([]*protocol.MemoryUser, 0, len(v.byEmail))
++	for _, u := range v.byEmail {
++		users = append(users, u)
++	}
++	return users
++}
++
++func (v *userValidator) GetCount() int64 {
++	v.mu.RLock()
++	defer v.mu.RUnlock()
++	return int64(len(v.byEmail))
++}
++
++// AddUser implements proxy.UserManager.AddUser().
++func (s *Server) AddUser(ctx context.Context, u *protocol.MemoryUser) error {
++	return s.validator.Add(u)
++}
++
++// RemoveUser implements proxy.UserManager.RemoveUser().
++func (s *Server) RemoveUser(ctx context.Context, email string) error {
++	return s.validator.Del(email)
++}
++
++// GetUser implements proxy.UserManager.GetUser().
++func (s *Server) GetUser(ctx context.Context, email string) *protocol.MemoryUser {
++	return s.validator.GetByEmail(email)
++}
++
++// GetUsers implements proxy.UserManager.GetUsers().
++func (s *Server) GetUsers(ctx context.Context) []*protocol.MemoryUser {
++	return s.validator.GetAll()
++}
++
++// GetUsersCount implements proxy.UserManager.GetUsersCount().
++func (s *Server) GetUsersCount(context.Context) int64 {
++	return s.validator.GetCount()
++}
++
++var _ proxy.UserManager = (*Server)(nil)
+-- 
+2.47.3
+
