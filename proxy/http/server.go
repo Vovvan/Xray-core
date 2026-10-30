@@ -31,6 +31,7 @@ import (
 type Server struct {
 	config        *ServerConfig
 	policyManager policy.Manager
+	authenticator Authenticator
 }
 
 // NewServer creates a new HTTP inbound handler.
@@ -42,6 +43,13 @@ func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	}
 
 	return s, nil
+}
+
+// SetAuthenticator replaces static account authentication with a dynamic
+// authenticator. It is used by the mixed inbound, which shares the SOCKS user
+// registry between its SOCKS and HTTP paths.
+func (s *Server) SetAuthenticator(a Authenticator) {
+	s.authenticator = a
 }
 
 func (s *Server) policy() policy.Session {
@@ -118,7 +126,20 @@ Start:
 		return errors.New("failed to read http request").Base(err)
 	}
 
-	if len(s.config.Accounts) > 0 {
+	if s.authenticator != nil {
+		user, pass, ok := parseBasicAuth(request.Header.Get("Proxy-Authorization"))
+		if !ok {
+			return common.Error2(conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")))
+		}
+		mu, authenticated := s.authenticator.Authenticate(user, pass)
+		if !authenticated || mu == nil {
+			return common.Error2(conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")))
+		}
+		if inbound != nil {
+			inbound.User.Email = mu.Email
+			inbound.User.Level = mu.Level
+		}
+	} else if len(s.config.Accounts) > 0 {
 		user, pass, ok := parseBasicAuth(request.Header.Get("Proxy-Authorization"))
 		if !ok || !s.config.HasAccount(user, pass) {
 			return common.Error2(conn.Write([]byte("HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n")))

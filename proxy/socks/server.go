@@ -31,23 +31,35 @@ type Server struct {
 	policyManager policy.Manager
 	cone          bool
 	httpServer    *http.Server
+	validator     *userValidator
 }
 
 // NewServer creates a new Server object.
 func NewServer(ctx context.Context, config *ServerConfig) (*Server, error) {
 	v := core.MustFromContext(ctx)
+	validator := newUserValidator()
+	if config.AuthType == AuthType_PASSWORD {
+		if err := validator.seed(config.Accounts, config.UserLevel); err != nil {
+			return nil, errors.New("failed to initialize socks users").Base(err)
+		}
+	}
 	s := &Server{
 		config:        config,
 		policyManager: v.GetFeature(policy.ManagerType()).(policy.Manager),
 		cone:          ctx.Value("cone").(bool),
+		validator:     validator,
 	}
 	httpConfig := &http.ServerConfig{
 		UserLevel: config.UserLevel,
 	}
-	if config.AuthType == AuthType_PASSWORD {
-		httpConfig.Accounts = config.Accounts
+	httpServer, err := http.NewServer(ctx, httpConfig)
+	if err != nil {
+		return nil, err
 	}
-	s.httpServer, _ = http.NewServer(ctx, httpConfig)
+	s.httpServer = httpServer
+	if config.AuthType == AuthType_PASSWORD {
+		s.httpServer.SetAuthenticator(validator)
+	}
 	return s, nil
 }
 
@@ -107,6 +119,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 
 	svrSession := &ServerSession{
 		config:       s.config,
+		validator:    s.validator,
 		address:      inbound.Gateway.Address,
 		port:         inbound.Gateway.Port,
 		localAddress: net.IPAddress(conn.LocalAddr().(*net.TCPAddr).IP),
@@ -134,6 +147,7 @@ func (s *Server) processTCP(ctx context.Context, conn stat.Connection, dispatche
 	}
 	if request.User != nil {
 		inbound.User.Email = request.User.Email
+		inbound.User.Level = request.User.Level
 	}
 
 	if err := conn.SetReadDeadline(time.Time{}); err != nil {
