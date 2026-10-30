@@ -35,6 +35,12 @@ jobs:
             https://github.com/XTLS/Xray-core.git target
           git -C target log --oneline -1
 
+      - name: Prepare geodata
+        run: |
+          mkdir -p target/resources
+          curl -fsSL -o target/resources/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          curl -fsSL -o target/resources/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+
       - name: Set up Go
         uses: actions/setup-go@v7
         with:

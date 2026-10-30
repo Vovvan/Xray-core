@@ -86,5 +86,11 @@ jobs:
           check-latest: true
           cache: true
 
+      - name: Prepare geodata
+        run: |
+          mkdir -p resources
+          curl -fsSL -o resources/geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          curl -fsSL -o resources/geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+
       - name: Test
         run: go test -timeout 45m ./...
