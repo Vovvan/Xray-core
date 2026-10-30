@@ -1,0 +1,202 @@
+package scenarios
+
+import (
+	"context"
+	"fmt"
+	"testing"
+	"time"
+
+	"github.com/xtls/xray-core/app/commander"
+	"github.com/xtls/xray-core/app/policy"
+	"github.com/xtls/xray-core/app/proxyman"
+	"github.com/xtls/xray-core/app/proxyman/command"
+	"github.com/xtls/xray-core/app/router"
+	"github.com/xtls/xray-core/common"
+	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/protocol"
+	"github.com/xtls/xray-core/common/serial"
+	core "github.com/xtls/xray-core/core"
+	"github.com/xtls/xray-core/proxy/dokodemo"
+	"github.com/xtls/xray-core/proxy/freedom"
+	"github.com/xtls/xray-core/proxy/socks"
+	"github.com/xtls/xray-core/testing/servers/tcp"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+)
+
+func TestSocksCommanderAddRemoveUser(t *testing.T) {
+	tcpServer := tcp.Server{
+		MsgProcessor: xor,
+	}
+	dest, err := tcpServer.Start()
+	common.Must(err)
+	defer tcpServer.Close()
+
+	serverPort := tcp.PickPort()
+	cmdPort := tcp.PickPort()
+
+	levelZero := &policy.Policy{
+		Timeout: &policy.Policy_Timeout{
+			UplinkOnly:   &policy.Second{Value: 0},
+			DownlinkOnly: &policy.Second{Value: 0},
+		},
+	}
+
+	serverConfig := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&commander.Config{
+				Tag: "api",
+				Service: []*serial.TypedMessage{
+					serial.ToTypedMessage(&command.Config{}),
+				},
+			}),
+			serial.ToTypedMessage(&router.Config{
+				Rule: []*router.RoutingRule{
+					{
+						InboundTag: []string{"api"},
+						TargetTag: &router.RoutingRule_Tag{
+							Tag: "api",
+						},
+					},
+				},
+			}),
+			serial.ToTypedMessage(&policy.Config{
+				Level: map[uint32]*policy.Policy{0: levelZero},
+			}),
+		},
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				Tag: "mixed",
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(serverPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&socks.ServerConfig{
+					AuthType: socks.AuthType_PASSWORD,
+					Address:  net.NewIPOrDomain(net.LocalHostIP),
+				}),
+			},
+			{
+				Tag: "api",
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(cmdPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
+				}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&freedom.Config{
+					FinalRules: []*freedom.FinalRuleConfig{{Action: freedom.RuleAction_Allow}},
+				}),
+			},
+		},
+	}
+
+	clientPort := tcp.PickPort()
+	clientConfig := &core.Config{
+		App: []*serial.TypedMessage{
+			serial.ToTypedMessage(&policy.Config{
+				Level: map[uint32]*policy.Policy{0: levelZero},
+			}),
+		},
+		Inbound: []*core.InboundHandlerConfig{
+			{
+				Tag: "d",
+				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
+					PortList: &net.PortList{Range: []*net.PortRange{net.SinglePortRange(clientPort)}},
+					Listen:   net.NewIPOrDomain(net.LocalHostIP),
+				}),
+				ProxySettings: serial.ToTypedMessage(&dokodemo.Config{
+					RewriteAddress:  net.NewIPOrDomain(dest.Address),
+					RewritePort:     uint32(dest.Port),
+					AllowedNetworks: []net.Network{net.Network_TCP},
+				}),
+			},
+		},
+		Outbound: []*core.OutboundHandlerConfig{
+			{
+				ProxySettings: serial.ToTypedMessage(&socks.ClientConfig{
+					Server: &protocol.ServerEndpoint{
+						Address: net.NewIPOrDomain(net.LocalHostIP),
+						Port:    uint32(serverPort),
+						User: &protocol.User{
+							Account: serial.ToTypedMessage(&socks.Account{
+								Username: "dynamic",
+								Password: "secret",
+							}),
+						},
+					},
+				}),
+			},
+		},
+	}
+
+	servers, err := InitializeServerConfigs(serverConfig, clientConfig)
+	common.Must(err)
+	defer CloseAllServers(servers)
+
+	if err := testTCPConn(clientPort, 1024, time.Second*2)(); err == nil {
+		t.Fatal("an empty dynamic registry accepted a user")
+	}
+
+	cmdConn, err := grpc.Dial(fmt.Sprintf("127.0.0.1:%d", cmdPort), grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
+	common.Must(err)
+	defer cmdConn.Close()
+
+	hsClient := command.NewHandlerServiceClient(cmdConn)
+	resp, err := hsClient.AlterInbound(context.Background(), &command.AlterInboundRequest{
+		Tag: "mixed",
+		Operation: serial.ToTypedMessage(&command.AddUserOperation{
+			User: &protocol.User{
+				Email: "dynamic@example.com",
+				Level: 7,
+				Account: serial.ToTypedMessage(&socks.Account{
+					Username: "dynamic",
+					Password: "secret",
+				}),
+			},
+		}),
+	})
+	common.Must(err)
+	if resp == nil {
+		t.Fatal("nil response")
+	}
+
+	countResp, err := hsClient.GetInboundUsersCount(context.Background(), &command.GetInboundUserRequest{Tag: "mixed"})
+	common.Must(err)
+	if countResp.Count != 1 {
+		t.Fatalf("user count = %d, want 1", countResp.Count)
+	}
+
+	usersResp, err := hsClient.GetInboundUsers(context.Background(), &command.GetInboundUserRequest{
+		Tag:   "mixed",
+		Email: "dynamic@example.com",
+	})
+	common.Must(err)
+	if len(usersResp.Users) != 1 || usersResp.Users[0].Email != "dynamic@example.com" || usersResp.Users[0].Level != 7 {
+		t.Fatalf("unexpected user response: %+v", usersResp.Users)
+	}
+
+	if err := testTCPConn(clientPort, 1024, time.Second*5)(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err = hsClient.AlterInbound(context.Background(), &command.AlterInboundRequest{
+		Tag:       "mixed",
+		Operation: serial.ToTypedMessage(&command.RemoveUserOperation{Email: "dynamic@example.com"}),
+	})
+	common.Must(err)
+	if resp == nil {
+		t.Fatal("nil response")
+	}
+
+	if err := testTCPConn(clientPort, 1024, time.Second*2)(); err == nil {
+		t.Fatal("a removed user can still authenticate")
+	}
+}
