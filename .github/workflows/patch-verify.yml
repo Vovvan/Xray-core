@@ -1,0 +1,62 @@
+name: patch-verify
+
+on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: Upstream tag to verify against
+        type: string
+        default: v26.10.21
+      patch_ref:
+        description: Branch containing PATCH-BASE, series, and patches/*.patch
+        type: string
+        default: patches/mixed-usermanager
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify patches on pristine upstream
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - name: Checkout patch archive
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.patch_ref }}
+          path: patch-repo
+          fetch-depth: 0
+
+      - name: Clone pristine upstream
+        run: |
+          git clone --branch "${{ inputs.base }}" --depth 1 \
+            https://github.com/XTLS/Xray-core.git target
+          git -C target log --oneline -1
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: target/go.mod
+          check-latest: true
+          cache: true
+          cache-dependency-path: target/go.sum
+
+      - name: Apply patches
+        run: |
+          shopt -s nullglob
+          patches=(../patch-repo/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No patches found in patch-repo/patches" >&2
+            exit 1
+          fi
+          git -c user.name=ci -c user.email=ci@example.com am -3 "${patches[@]}"
+
+      - name: Build
+        working-directory: target
+        run: go build ./...
+
+      - name: Test
+        working-directory: target
+        run: go test -timeout 45m ./...
